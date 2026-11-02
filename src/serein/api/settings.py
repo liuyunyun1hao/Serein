@@ -442,9 +442,13 @@ def routes(settings, auth):
 
     @router.patch('/v1/settings')
     def save(body: SettingsPatch, response: Response):
+        patch = body.model_dump(exclude_none=True)
+        # 记忆尚未就绪时不允许开启「聊天时自动带入记忆」，但绝不因此拒绝保存其它配置。
+        # 旧实现直接抛 409，而前端的该开关在未就绪时是禁用的：用户既关不掉它，
+        # 也存不进 embedding/reranker 的指派，于是永远准备不了索引，形成死锁。
         if body.upstream and body.upstream.memory_enabled and not memory_ready(settings):
-            raise HTTPException(409, 'Configure embedding, reranker and semantic routes before enabling memory')
-        save_settings(settings.database, body.model_dump(exclude_none=True))
+            patch['upstream'] = {**(patch.get('upstream') or {}), 'memory_enabled': False}
+        save_settings(settings.database, patch)
         if not memory_ready(settings) and read_settings(settings.database)['upstream']['memory_enabled']:
             save_settings(settings.database, {'upstream': {'memory_enabled': False}})
         return read(response)

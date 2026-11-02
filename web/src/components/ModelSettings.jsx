@@ -180,7 +180,7 @@ export function ModelSettings({page,onOpenEventGuide,onOpenPipeline,onOpenCatalo
       <p><button type="button" className="settings-link" onClick={onOpenCatalog}>管理上游与模型</button></p>
       <label className="settings-toggle"><span><strong>聊天时自动带入记忆</strong><small>{memoryAvailabilitySummary(config)}</small></span>
         <input type="checkbox" role="switch" disabled={!config.memory_ready} checked={config.upstream.memory_enabled} onChange={event=>option("memory_enabled",event.target.checked)} /></label>
-      <div className="settings-actions"><button disabled={busy || !config.assignments.embedding || (config.index_status && config.index_status.status !== "ready")} type="button" onClick={prepare}>建立 / 补齐检索索引</button>
+      <div className="settings-actions"><button disabled={busy || !config.assignments.embedding} type="button" onClick={prepare}>建立 / 补齐检索索引</button>
         <button type="button" disabled={busy} onClick={async()=>{try{await refreshIndexStatus();}catch(error){setStatus(error.message);}}}>刷新索引状态</button>
         {(config.index_status?.status === 'paused' || config.index_status?.status === 'running') && <button type="button" disabled={busy} onClick={recoverIndex}>修正后恢复索引</button>}
       </div>
