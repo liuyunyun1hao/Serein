@@ -11,7 +11,8 @@ import types
 from uuid import uuid4
 import zipfile
 
-REPOSITORY = 'Yinglianchun/Serein'
+# 个人部署默认从自己的 fork 拉取（含本地修复）；可用环境变量切回官方。
+REPOSITORY = os.environ.get('SEREIN_UPSTREAM_REPO', 'liuyunyun1hao/Serein')
 REMOTE = f'https://github.com/{REPOSITORY}.git'
 BRANCH = 'main'
 MAX_SOURCE_BYTES = 300 * 1024 * 1024
