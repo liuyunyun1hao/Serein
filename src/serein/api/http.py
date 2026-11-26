@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -62,6 +63,21 @@ def create_app(settings, *, token: str, live: bool=False, token_file: Path | Non
                 yield
 
     app = FastAPI(title='Serein', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+    # 浏览器跨域：默认不启用（保持原行为与安全边界）。
+    # 需要让网页端（例如 GitHub Pages 上的前端）直连时，设置环境变量
+    #   SEREIN_ALLOWED_ORIGINS="https://example.github.io,http://localhost:5173"
+    # 逗号分隔、按 origin 精确匹配；不要用它放行任意站点。
+    allowed_origins = [o.strip().rstrip('/') for o in os.environ.get('SEREIN_ALLOWED_ORIGINS', '').split(',') if o.strip()]
+    if allowed_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=allowed_origins,
+            allow_credentials=True,
+            allow_methods=['GET', 'POST', 'DELETE', 'OPTIONS'],
+            allow_headers=['*'],
+            expose_headers=['Mcp-Session-Id', 'MCP-Protocol-Version'],
+            max_age=86400,
+        )
     active_token = token
     token_lock = Lock()
 
@@ -114,7 +130,11 @@ def create_app(settings, *, token: str, live: bool=False, token_file: Path | Non
             # Gateway overwrites X-Forwarded-Host; direct core clients use Host.
             origin = headers.get('origin')
             try:
-                origin_ok = not origin or urlsplit(origin).netloc == headers.get('x-forwarded-host', headers.get('host'))
+                if not origin:
+                    origin_ok = True
+                else:
+                    origin_ok = (urlsplit(origin).netloc == headers.get('x-forwarded-host', headers.get('host'))
+                                 or origin.rstrip('/') in allowed_origins)
             except ValueError:
                 origin_ok = False
             if not origin_ok:
