@@ -6,10 +6,10 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from ..core.store import Store, Conflict, encode, digest, now
 from ..deployment import identity, task_model, read_settings
-from .pipeline_limits import blocks, routing_blocks, settlement_window, allowed_ids
+from .pipeline_limits import blocks, routing_blocks, frames_with_lookahead, settlement_window, allowed_ids
 from ..compat.events import Events, reference_blockers
 from ..compat.germany.fact_events import FactEventStore, FactEventSettlementBlockedError
-from .pipeline_rules import dialogue_units, dialogue_unit_is_complete, normalize_event_track_message_output, flushable_dialogue_units
+from .pipeline_rules import dialogue_units, iter_dialogue_units, dialogue_unit_is_complete, normalize_event_track_message_output, flushable_dialogue_units
 from . import pipeline_latest as latest
 from . import pipeline_materials
 from .pipeline_config import snapshot, execution
@@ -67,7 +67,7 @@ def initialize(database):
             CREATE TABLE IF NOT EXISTS pipeline_event_details(event_id TEXT PRIMARY KEY,details_json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS pipeline_schedule(day TEXT PRIMARY KEY,completed INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS pipeline_attempts(id INTEGER PRIMARY KEY,job_id TEXT NOT NULL,attempt INTEGER NOT NULL,
-                created_at TEXT NOT NULL,output_text TEXT NOT NULL,error TEXT NOT NULL);
+                created_at TEXT NOT NULL,output_text TEXT NOT NULL,error TEXT NOT NULL,model TEXT,prompt_chars INTEGER);
             CREATE TABLE IF NOT EXISTS pipeline_job_failures(job_id TEXT PRIMARY KEY,failures INTEGER NOT NULL,error TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS pipeline_media(batch_id TEXT NOT NULL,source_message_id INTEGER NOT NULL,
                 position INTEGER NOT NULL,sha256 TEXT NOT NULL,mime_type TEXT NOT NULL,body BLOB NOT NULL,
@@ -75,7 +75,8 @@ def initialize(database):
         ''')
         from .pipeline_recovery import initialize as initialize_recovery
         initialize_recovery(store.conn)
-        pending_materials.initialize(store.conn)
+        with store.transaction(immediate=True):
+            pending_materials.initialize(store.conn)
         from ..image_transcription import initialize_failures
         initialize_failures(store.conn)
         from ..imports import archive_imported_originals
@@ -150,6 +151,23 @@ SCOPE_HEAD="""NOT EXISTS (SELECT 1 FROM pipeline_batches h WHERE h.scope=b.scope
     (COALESCE(json_extract(h.input_json,'$.queue_order'),h.rowid),COALESCE(json_extract(h.input_json,'$.recovery_path'),''),h.rowid)<
     (COALESCE(json_extract(b.input_json,'$.queue_order'),b.rowid),COALESCE(json_extract(b.input_json,'$.recovery_path'),''),b.rowid))"""
 QUEUE_ORDER="COALESCE(json_extract(b.input_json,'$.queue_order'),b.rowid),COALESCE(json_extract(b.input_json,'$.recovery_path'),''),b.rowid"
+
+
+def pending_session_messages(conn, source, session, filters):
+    page_size = 48
+    query = ('SELECT r.* FROM raw_events r WHERE source=? AND session_id=? '
+             'AND NOT EXISTS (SELECT 1 FROM raw_processing p WHERE p.raw_id=r.id)' + filters)
+    after = None
+    while True:
+        clause = '' if after is None else ' AND r.id>?'
+        args = (source, session) if after is None else (source, session, after)
+        count = 0
+        for row in conn.execute(query + clause + ' ORDER BY r.id LIMIT ?', (*args, page_size)):
+            count += 1
+            after = row['id']
+            yield task_message(row)
+        if count < page_size:
+            return
 
 
 def new_batch(database,include_recent,clock=None,*,retry_repair=False):
@@ -242,20 +260,20 @@ def new_batch(database,include_recent,clock=None,*,retry_repair=False):
             complete_upload=" AND (json_extract(r.metadata_json,'$.import_upload_id') IS NULL OR json_extract(r.metadata_json,'$.import_upload_id') IN (SELECT id FROM file_imports WHERE cursor=COALESCE(json_extract(payload_json,'$.total'),json_array_length(payload_json,'$.entries'))))"
         import_boundary=" AND NOT EXISTS (SELECT 1 FROM pipeline_import_boundaries b WHERE b.upload_id=json_extract(r.metadata_json,'$.import_upload_id') AND b.released=0)"
         import_boundary+=pending_materials.reservation_clause()
-        scopes=store.conn.execute('SELECT DISTINCT r.source,r.session_id FROM raw_events r WHERE NOT EXISTS (SELECT 1 FROM raw_processing p WHERE p.raw_id=r.id)'+complete_upload+import_boundary+' ORDER BY r.id').fetchall()
+        scopes=store.conn.execute('SELECT r.source,r.session_id FROM raw_events r WHERE NOT EXISTS (SELECT 1 FROM raw_processing p WHERE p.raw_id=r.id)'+complete_upload+import_boundary+' ORDER BY r.id')
+        visited = set()
         for source,session in scopes:
+            if (source, session) in visited:continue
+            visited.add((source, session))
             if digest(encode([source,session]))[:20] in held_scopes:continue
-            rows=[task_message(row) for row in store.conn.execute('SELECT r.* FROM raw_events r WHERE source=? AND session_id=? AND NOT EXISTS (SELECT 1 FROM raw_processing p WHERE p.raw_id=r.id)'+complete_upload+import_boundary+' ORDER BY r.id',(source,session))]
-            # Evaluate the watermark against full envelopes before filtering rows.
-            eligible=[m for unit in dialogue_units(rows)
-                      if max(datetime.fromisoformat(m['created_at'].replace('Z','+00:00')) for m in unit)<=watermark
-                      for m in unit]
-            chunks=routing_blocks(eligible,policy['max_input_chars'])
-            for chunk_index,eligible in enumerate(chunks):
-                if chunk_index+1<len(chunks):
-                    following=dialogue_units(chunks[chunk_index+1])[0]
-                    if not dialogue_unit_is_complete(following):
-                        eligible=[*eligible,*following]  # A later correction must remain readable, never owned.
+            rows = pending_session_messages(store.conn, source, session, complete_upload + import_boundary)
+            # Test the watermark on whole envelopes, even across database pages.
+            eligible_rows = (m for unit in iter_dialogue_units(rows)
+                             if max(datetime.fromisoformat(m['created_at'].replace('Z','+00:00')) for m in unit)<=watermark
+                             for m in unit)
+            for eligible, following in frames_with_lookahead(eligible_rows, policy['max_input_chars']):
+                if following and not dialogue_unit_is_complete(following):
+                    eligible = [*eligible, *following]
                 stable=[];parked=[]
                 # Reply envelopes determine completion / parked tails, while the latest
                 # Router supplies individual messages as Curator ownership atoms.
@@ -541,11 +559,12 @@ async def route_batch(database,batch,data,runner):
             cards=track_state.update_cards(cards,routed,updates,block,data['scope'])
         assignments.extend(routed);prior.extend(block);cursor+=len(block)
     max_chars=data.get('input_policy',{}).get('max_input_chars',read_settings(database)['pipeline']['max_input_chars'])
+    routed_ids={a['source_message_id'] for a in assignments}
     for index,block in enumerate(routing_blocks(data['routing_messages'][cursor:],max_chars),len(frozen)):
         bounded={**data,'routing_messages':block,'tracks':track_state.parked(cards),'next_track_ordinal':ordinal,'recent':router_recent(prior,block)}
         prompt_batch={**batch,'input_json':encode(bounded)}
         with Store(database,read_only=True) as store:
-            track_state.assert_before(store,cards,block[0]['id'])
+            track_state.assert_before(store,cards,block[0]['id'],routed_ids=routed_ids)
         request=request_for(database,prompt_batch,'track_router')
         output=await job(database,batch,request,f'track_router:{index}',runner)
         block=_router_prefix(data,request,cursor)
@@ -554,6 +573,7 @@ async def route_batch(database,batch,data,runner):
         with latest.identity_scope(identity(database)):
             cards=track_state.update_cards(cards,routed,updates,block,data['scope'])
         assignments.extend(routed);prior.extend(block);cursor+=len(block)
+        routed_ids.update(a['source_message_id'] for a in routed)
     used={t for a in assignments for t in [a['primary_track_id'],*a['context_track_ids']]}
     return {'assignments':assignments,'tracks':[t for t in cards if t['track_id'] in used],
             'track_state_updates':cards,'next_track_ordinal':ordinal,'_public_normalized':True}
@@ -579,9 +599,19 @@ def candidates(database,track_ids,*,overflow_out=None):
                 continue
             for row in rows:
                 refs=[dict(ref) for ref in store.conn.execute('SELECT * FROM fact_event_sources WHERE item_id=? ORDER BY id',(row['item_id'],))]
+                # The nonempty predicate lets SQLite use the existing partial
+                # source/event-id index instead of scanning the source per ref.
+                raw_by_key={}
+                if any(ref['message_id'] for ref in refs):
+                    for raw in store.conn.execute('SELECT r.* FROM fact_event_sources s JOIN raw_events r '
+                            'ON r.source=s.source_system AND r.session_id=s.session_id AND r.source_event_id=s.message_id '
+                            "WHERE s.item_id=? AND r.source_event_id!=''",(row['item_id'],)):
+                        raw_by_key[(raw['source'],raw['session_id'],raw['source_event_id'])]=raw
                 originals=[]
                 for ref in refs:
-                    raw=store.conn.execute('SELECT * FROM raw_events WHERE source=? AND session_id=? AND source_event_id=?',source_key(ref)).fetchone()
+                    # Legacy empty IDs are not unique; retain their first-row lookup.
+                    raw=(raw_by_key.get(source_key(ref)) if ref['message_id'] else
+                         store.conn.execute('SELECT * FROM raw_events WHERE source=? AND session_id=? AND source_event_id=?',source_key(ref)).fetchone())
                     originals.append(task_message(raw) if raw else task_message({'id':-int(digest(encode(source_key(ref)))[:12],16),'source':ref['source_system'],'source_event_id':ref['message_id'],'session_id':ref['session_id'],'role':ref['role'],'text':ref['content'],'created_at':ref['created_at']}))
                 detail=store.conn.execute('SELECT details_json FROM pipeline_event_details WHERE event_id=?',(row['item_id'],)).fetchone()
                 details=json.loads(detail[0]) if detail else {}
@@ -598,7 +628,10 @@ def candidates(database,track_ids,*,overflow_out=None):
                 trusted=bool(family_ids) and all(str(origin or '').startswith('assistant_bridge:')
                     for origin, in store.conn.execute('SELECT origin_id FROM fact_events WHERE item_id IN ('+
                         ','.join('?' for _ in family_ids)+')',family_ids))
-                result.append({**dict(row),'event_id':row['item_id'],'primary_track_id':track,'track_id':track,'source_refs':refs,'originals':originals,
+                # Settlement checks predecessor identity by these three fields. The
+                # verified originals already carry the full text in the corridor.
+                source_refs=[{key:ref[key] for key in ('source_system','session_id','message_id')} for ref in refs]
+                result.append({**dict(row),'event_id':row['item_id'],'primary_track_id':track,'track_id':track,'source_refs':source_refs,'originals':originals,
                     'source_message_ids':[m['id'] for m in originals],'session_ids':list({m['session_id'] for m in originals}),
                     'source_activity_roles':details.get('source_activity_roles',{}),'blocked':bool(blockers),
                     'material_snapshot':details.get('material_snapshot') if consistent_sources else None,
@@ -1007,6 +1040,8 @@ def request_for(database,batch,role,**fields):
 def prepare_stage_output(request, output):
     if not isinstance(output, dict):
         return output
+    if request['role'] == 'event_curator':
+        output = latest.prepare_compact_event_curator_output(output)
     if (request['role'] == 'event_writer' and set(output) == {'type', 'content'}
             and output['type'] == 'json_object' and isinstance(output['content'], dict)):
         output = output['content']
@@ -1045,7 +1080,7 @@ def validate(request,output):
     if request.get('transcription_only'):
         if set(output)!={'image_transcriptions'}:
             raise ValueError('补读图片只允许返回转录，不改变 Event 归属；顶层只能有 image_transcriptions，'
-                             f"missing={sorted({'image_transcriptions'}-set(output))}, extra={sorted(set(output)-{'image_transcriptions'})}。")
+                             f"missing={sorted({'image_transcriptions'}-set(output))}, extra={latest.curator_extra_fields(set(output)-{'image_transcriptions'})}。")
         bind_transcriptions(output,request.get('images',[]));return
     if role in ('event_curator','event_writer') and output.get('context_request') is not None:
         c=output['context_request'];component=request['component']
@@ -1053,7 +1088,7 @@ def validate(request,output):
             raise ValueError('此 component 已补读一次，不得再次返回非空 context_request；请返回正常任务结果，证据不足则按证据不足格式返回。')
         if set(output)!={'context_request'}:
             raise ValueError('申请补读时顶层只允许 context_request；'
-                             f"请删除额外字段 extra={sorted(set(output)-{'context_request'})}，即使它们为 false、空字符串、空数组或空对象。")
+                             f"请删除额外字段 extra={latest.curator_extra_fields(set(output)-{'context_request'})}，即使它们为 false、空字符串、空数组或空对象。")
         if not isinstance(c,dict):
             raise ValueError('context_request 必须是对象，包含 track_id、before_message_id、reason。')
         if role=='event_curator' and 'pending_material_id' in c:
@@ -1074,15 +1109,17 @@ def validate(request,output):
         fields={'track_id','before_message_id','reason'}
         if set(c)!=fields:
             raise ValueError('context_request 字段不符：'
-                             f'missing={sorted(fields-set(c))}, extra={sorted(set(c)-fields)}。')
+                             f'missing={sorted(fields-set(c))}, extra={latest.curator_extra_fields(set(c)-fields)}。')
         if c['track_id'] not in component['track_ids']:
-            raise ValueError(f"context_request.track_id 必须属于本 component：allowed={component['track_ids']!r}, received={c['track_id']!r}。")
+            raise ValueError(f"context_request.track_id 必须属于本 component：allowed={component['track_ids']!r}, received={latest.curator_received_value(c['track_id'])}。")
         before=min(m['id'] for m in component['messages'])
         if type(c['before_message_id']) is not int or c['before_message_id']!=before:
-            raise ValueError(f"context_request.before_message_id 必须是本 component 的最小消息 ID：expected={before}, received={c['before_message_id']!r}。")
+            value=c['before_message_id']
+            received=repr(value) if type(value) in (bool,int) or value==str(before) else latest.curator_received_value(value)
+            raise ValueError(f"context_request.before_message_id 必须是本 component 的最小消息 ID：expected={before}, received={received}。")
         reasons=('missing_subject','missing_origin','missing_prior_claim')
         if c['reason'] not in reasons:
-            raise ValueError(f"context_request.reason 只能为 {reasons!r}，received={c['reason']!r}。")
+            raise ValueError(f"context_request.reason 只能为 {reasons!r}，received={latest.curator_received_value(c['reason'])}。")
         return
     with latest.identity_scope(request['identity']):
         if role=='track_router':
@@ -1110,12 +1147,12 @@ def validate(request,output):
             if errors:raise ValueError('; '.join(errors))
 
 
-def record_attempt(database,job_id,output,error=''):
+def record_attempt(database,job_id,output,error='',*,model=None,prompt_chars=None):
     if not isinstance(output,str):output=encode(output)
     with Store(database) as store,store.transaction(immediate=True):
         number=store.conn.execute('SELECT count(*) FROM pipeline_attempts WHERE job_id=?',(job_id,)).fetchone()[0]+1
-        store.conn.execute('INSERT INTO pipeline_attempts(job_id,attempt,created_at,output_text,error) VALUES (?,?,?,?,?)',
-            (job_id,number,now(),output[:2_000_000],error[:1000]))
+        store.conn.execute('INSERT INTO pipeline_attempts(job_id,attempt,created_at,output_text,error,model,prompt_chars) VALUES (?,?,?,?,?,?,?)',
+            (job_id,number,now(),output[:2_000_000],error[:1000],model,prompt_chars))
 
 
 def curator_omission_attempts(database,job_id):
@@ -1129,24 +1166,47 @@ def curator_omission_attempts(database,job_id):
 
 def curator_repair_prompt(request, output, error):
     missing=set(error.missing_source_ids)
-    messages=[item for item in request['component']['messages'] if int(item['id']) in missing]
+    component=pending_materials.adopted_component(request['component'],output)
+    messages=[item for item in component['messages'] if int(item['id']) in missing]
+    effective_request={**request,'component':component}
     return request['prompt']+'\n漏项修复：保留上一份结果中已有的有效归属和处置，对照完整上下文补全遗漏。必要时修正关联的边界和回执；不得为通过校验一律 skip/defer，不得猜测归属。返回修复后的完整 JSON，程序会重新检查全部来源、重复归属和冲突。\n'+encode({
         'missing_source_message_ids':error.missing_source_ids,
+        'missing_unit_roots':error.missing_unit_roots,
         'missing_messages':messages,
-        'previous_output':output, **curator_material_repair_scope(request, output)})
+        'allowed_ids':allowed_ids(effective_request),
+        'previous_output':output, **curator_material_repair_scope(request, output, component=component)})
 
 
-def curator_material_repair_scope(request, output):
+def correction_scope(request, output):
+    if request['role']!='event_curator' or not isinstance(output,dict):
+        return {'allowed_ids':allowed_ids(request)}
+    try:
+        component=pending_materials.adopted_component(request['component'],output)
+    except ValueError:
+        return {'allowed_ids':allowed_ids(request)}
+    return {'allowed_ids':allowed_ids({**request,'component':component}),
+            **curator_material_repair_scope(request,output,component=component)}
+
+
+def curator_material_repair_scope(request, output, *, component=None):
     """Host-owned annotation IDs; malformed ownership is repaired separately."""
-    component=request.get('component') or {}
-    if (request.get('role')!='event_curator' or not component.get('writer_material_review')
+    if (request.get('role')!='event_curator' or not request.get('component',{}).get('writer_material_review')
             or not isinstance(output,dict)):
         return {}
     try:
+        if component is None:
+            component=pending_materials.adopted_component(request['component'],output)
         expanded=decision(output)
         expanded={key:value for key,value in expanded.items() if key!='decision_review'}
         if 'skip_unit_roots' in expanded:
             expanded=latest._expand_compact_event_curator_output(expanded,component)
+        elif component.get('pending_material_read'):
+            # Expanded replies supply their own bindings. Check ownership before
+            # labeling any of those IDs as host-approved annotation sources.
+            try:
+                latest._normalize_expanded_event_curator_output(expanded,component)
+            except latest.CuratorCoverageError:
+                pass  # Existing bindings are in scope even when other units were omitted.
         contracts=pipeline_materials.material_contracts(expanded,component)
         return {'material_annotation_source_ids_by_event':{
             str(index):contract['annotation_source_message_ids'] for index,contract in contracts.items()}}
@@ -1154,18 +1214,21 @@ def curator_material_repair_scope(request, output):
         return {}
 
 
-def accept_curator_omission(database,job_id,error):
+def accept_curator_omission(database,job_id,error,previous_output,frozen_request):
     # Discard the incomplete decision; only the host may retain its full scope.
     with Store(database) as store,store.transaction(immediate=True):
         row=store.conn.execute('SELECT j.request_json,j.output_json,b.status FROM pipeline_jobs j JOIN pipeline_batches b ON b.id=j.batch_id WHERE j.id=?',(job_id,)).fetchone()
-        if row is None or row['status'].startswith('superseded_'):
+        if row is None or row['request_json']!=frozen_request or row['status'].startswith('superseded_'):
             raise Conflict('Curator job changed before its omission could be retained')
         request=json.loads(row['request_json'])
-        stable_ids={int(item['id']) for item in request.get('component',{}).get('messages') or []}
+        component=pending_materials.adopted_component(request.get('component',{}),previous_output)
+        stable_ids={int(item['id']) for item in component.get('messages') or []}
         missing=sorted(set(error.missing_source_ids))
         if request['role']!='event_curator' or not missing or not set(missing).issubset(stable_ids):
             raise ValueError('Host Curator omission record is outside its frozen stable sources')
         output={'_host_curator_omission':{'job_id':job_id,'missing_source_message_ids':missing}}
+        if component.get('adopted_pending_ids'):
+            output['_host_curator_omission']['adopt_pending_material_ids']=component['adopted_pending_ids']
         if row['output_json'] and row['output_json']!=encode(output):
             raise Conflict('This job already has a different result')
         store.conn.execute('UPDATE pipeline_jobs SET output_json=? WHERE id=?',(encode(output),job_id))
@@ -1174,11 +1237,8 @@ def accept_curator_omission(database,job_id,error):
 
 def submit(database,job_id,output):
     try:return _submit(database,job_id,output)
-    except latest.CuratorCoverageError as error:
-        record_attempt(database,job_id,encode(output),str(error))
-        if curator_omission_attempts(database,job_id)<2:
-            raise
-        return accept_curator_omission(database,job_id,error)
+    except latest.CuratorCoverageError:
+        raise  # The validation attempt was already recorded against its frozen request.
     except ValueError as error:
         record_attempt(database,job_id,encode(output),str(error))
         raise
@@ -1205,6 +1265,11 @@ def _submit(database,job_id,output):
         return {'status':'unchanged','job_id':job_id}
     try:
         validate(request,output)
+    except latest.CuratorCoverageError as error:
+        record_attempt(database,job_id,encode(output),str(error))
+        if curator_omission_attempts(database,job_id)<2:
+            raise
+        return accept_curator_omission(database,job_id,error,output,frozen_request)
     except ValueError as error:
         if request.get('transcription_only') and len(request.get('images',[]))==1:
             from ..image_transcription import record_image_failure, image_failures, FAILURE_LIMIT
@@ -1247,13 +1312,14 @@ def stage_failures(database,job_id):
     return row[0] if row else 0
 
 
-def fail_stage(database,batch,job_id,error):
+def fail_stage(database,batch,job_id,error,*,pause_reason=None):
     from ..work_tasks import failure_reason
-    reason=failure_reason(error)
+    reason=pause_reason or failure_reason(error)
     with Store(database) as store,store.transaction(immediate=True):
         store.conn.execute("INSERT INTO pipeline_job_failures VALUES (?,1,?) ON CONFLICT(job_id) DO UPDATE SET failures=failures+1,error=excluded.error",(job_id,reason))
         count=store.conn.execute('SELECT failures FROM pipeline_job_failures WHERE job_id=?',(job_id,)).fetchone()[0]
-        if count>=3:
+        pause=pause_reason is not None or count>=3
+        if pause:
             result={'status':'paused','batch_id':batch['id'],'scope':json.loads(batch['input_json'])['scope'],'job_id':job_id,'reason':reason,'failures':count}
             store.conn.execute("UPDATE pipeline_batches SET status='paused_failure',result_json=? WHERE id=?",(encode(result),batch['id']))
         elif batch['id'].startswith('route:'):
@@ -1262,7 +1328,7 @@ def fail_stage(database,batch,job_id,error):
                     'job_id':job_id,'reason':reason,'failures':count,'next_retry_at':retry_at}
             store.conn.execute("UPDATE pipeline_batches SET status='retry_wait',result_json=? WHERE id=?",
                                (encode(result),batch['id']))
-    if count>=3:raise PausedBatch(reason) from error
+    if pause:raise PausedBatch(reason) from error
 
 
 def retry_batch(database,batch_id):
@@ -1313,6 +1379,13 @@ async def job(database,batch,request,key,runner):
     incoming=request
     current_execution=request['execution']
     request=hydrate_request_images(database,batch['id'],json.loads(row['request_json']))
+    capacity_recovery=incoming.get('event',{}).get('capacity_recovery',{})
+    if (request['role']=='event_writer' and not row['output_json']
+            and (request.get('writer_mode')=='append' or request.get('event',{}).get('action')=='extend')
+            and capacity_recovery.get('action')=='create'
+            and capacity_recovery.get('base_event_id') in request.get('event',{}).get('base_event_ids',[])):
+        # Use the validated follow-up plan when an unfinished frozen append no longer fits.
+        request=dict(incoming)
     if request['role']=='event_writer' and not row['output_json'] and request.get('writer_previous_body_only')!=3:
         request=request_for(database,batch,'event_writer',**{key:request[key] for key in
             ('messages','event','component','context_read') if key in request})
@@ -1333,8 +1406,10 @@ async def job(database,batch,request,key,runner):
         total=store.conn.execute("SELECT count(*) FROM pipeline_jobs WHERE batch_id=? AND json_extract(request_json,'$.role')!='event_evidence'",(batch['id'],)).fetchone()[0]
     progress(stage=request['role'],batch_id=batch['id'],completed=completed,total=total,job_id=identifier)
     if row['output_json']:return json.loads(row['output_json'])
-    if request.get('writer_mode')=='append' and request['append_remaining_chars']<=0:
-        raise FactEventSettlementBlockedError('旧 Event 已达整篇 1500 字符上限，无法追加；请作废本批计划并重新归线，新计划会处理容量不足；旧正文与原话仍保留。')
+    if request.get('writer_mode')=='append' and request['append_remaining_chars']<latest.EVENT_APPEND_MIN_REMAINING_CHARS:
+        raise FactEventSettlementBlockedError(
+            f"旧 Event 仅剩 {request['append_remaining_chars']} 字符，追加空间不足；"
+            '请作废本批计划并重新归线，新计划会处理容量不足；旧正文与原话仍保留。')
     config=snapshot(database,batch['id']);policy=config['policy']
     prompt_chars=len(request['prompt'])+len(request['rules'])
     progress(prompt_chars=prompt_chars,timeout_seconds=policy['timeout_seconds'])
@@ -1352,18 +1427,20 @@ async def job(database,batch,request,key,runner):
     model=config['models'].get(request.get('execution',{}).get('task',request['role'])) if policy['execution_mode']!='agent' else None
     if model is None and request.get('transcription_only') and policy['execution_mode']!='agent':
         model=config['models'].get('event_curator')
-    if not runner and not model:
+    agent_delivery=not runner and not model
+    image=request['images'][0] if request.get('transcription_only') and len(request.get('images',[]))==1 else None
+    if image:
+        from ..image_transcription import image_failures, record_image_failure, FAILURE_LIMIT
+        # An Agent fallback hands the image to the same executor again.
+        if (agent_delivery or not request.get('transcription_fallback')) and image_failures(database,image['sha256'])>=FAILURE_LIMIT:
+            raise ValueError('图片转录已失败三次，等待手动重试')
+    if agent_delivery:
         task=agent_task(request,identifier,policy['max_prompt_chars'])
         delivery_chars=len(encode(agent_text_task(task)))
         if delivery_chars>policy['max_prompt_chars']:
             raise PromptLimitError(f"当前 Agent 任务完整返回包共 {delivery_chars} 字符，超过 {policy['max_prompt_chars']} 字符上限；"
                              '包含工具任务结构与 JSON 转义，尚未截断或交付。请减小每批材料后重建未完成计划。')
         raise AwaitAgent(task)
-    image=request['images'][0] if request.get('transcription_only') and len(request.get('images',[]))==1 else None
-    if image:
-        from ..image_transcription import image_failures, record_image_failure, FAILURE_LIMIT
-        if not request.get('transcription_fallback') and image_failures(database,image['sha256'])>=FAILURE_LIMIT:
-            raise ValueError('图片转录已失败三次，等待手动重试')
     if runner:
         try:output=await runner(request['role'],request)
         except Exception as error:
@@ -1371,12 +1448,12 @@ async def job(database,batch,request,key,runner):
             else:fail_stage(database,batch,identifier,error)
             raise
     else:
-        from ..model_runtime import complete
+        from ..model_runtime import UpstreamError, complete
         prompt=request['prompt']
         attempts=1 if request.get('transcription_fallback') else FAILURE_LIMIT-image_failures(database,image['sha256']) if image else max(1,3-stage_failures(database,identifier))
         for attempt in range(attempts):
-            progress(attempt=attempt+1,stage=request['role'],
-                     prompt_chars=len(prompt)+len(request['rules']))
+            prompt_chars=len(prompt)+len(request['rules'])
+            progress(attempt=attempt+1,stage=request['role'],prompt_chars=prompt_chars)
             raw='';received=False;output={}
             try:
                 content=([{'type':'text','text':prompt}]+[{'type':'image_url','image_url':{'url':item['url']}} for item in request.get('images',[])]) if request.get('images') else prompt
@@ -1399,26 +1476,32 @@ async def job(database,batch,request,key,runner):
                     raise ValueError('模型未返回最终 JSON 内容'+suffix)
                 output=prepare_stage_output(request,json.loads(raw))
                 validate(request,output)
-                record_attempt(database,identifier,raw)
+                record_attempt(database,identifier,raw,model=model['model'],prompt_chars=prompt_chars)
                 break
             except Exception as error:
                 from ..work_tasks import failure_reason
-                reason=failure_reason(error)
-                record_attempt(database,identifier,raw,reason)
+                rejected=(not request.get('transcription_only') and isinstance(error,UpstreamError)
+                          and error.response.status_code==400)
+                if rejected:
+                    stage={'track_router':'归线','event_curator':'切分','event_writer':'Event 写作'}[request['role']]
+                    reason=f'上游拒绝了{stage}请求（HTTP 400），没有收到模型正文。请检查该阶段的模型、输入长度和请求格式。'
+                else:
+                    reason=failure_reason(error)
+                record_attempt(database,identifier,raw,reason,model=model['model'],prompt_chars=prompt_chars)
                 progress(error=reason,attempt=attempt+1)
                 if isinstance(error,latest.CuratorCoverageError):
                     if curator_omission_attempts(database,identifier)>=2:
-                        return accept_curator_omission(database,identifier,error)['output']
+                        return accept_curator_omission(database,identifier,error,output,encoded_request)['output']
                     prompt=curator_repair_prompt(request,output,error)
                     if len(prompt)+len(request['rules'])>policy['max_prompt_chars']:
-                        return accept_curator_omission(database,identifier,error)['output']
+                        return accept_curator_omission(database,identifier,error,output,encoded_request)['output']
                     if attempt==attempts-1:
-                        return accept_curator_omission(database,identifier,error)['output']
+                        return accept_curator_omission(database,identifier,error,output,encoded_request)['output']
                     continue
                 elif image:record_image_failure(database,image,error)
-                else:fail_stage(database,batch,identifier,error)
+                else:fail_stage(database,batch,identifier,error,pause_reason=reason if rejected else None)
                 if (not image and (not received or not isinstance(error,ValueError))) or attempt==attempts-1:raise
-                correction='\n请按原角色规则纠正结构或证据校验错误，只返回完整 JSON。保留人物归属、比喻及不确定程度，不按词句数量改写文风。编号使用原始编号，不得按展示位置重新编号。\n'+('materials 必须只覆盖 host 指定的 material_annotation_source_ids_by_event；继承标注只读，不重复输出。\n' if request['role']=='event_curator' and request.get('component',{}).get('writer_material_review') else '')+encode({'validation_error':reason,'allowed_ids':allowed_ids(request), **curator_material_repair_scope(request,output)})
+                correction='\n请按原角色规则纠正结构或证据校验错误，只返回完整 JSON。保留人物归属、比喻及不确定程度，不按词句数量改写文风。编号使用原始编号，不得按展示位置重新编号。\n'+('materials 必须只覆盖 host 指定的 material_annotation_source_ids_by_event；继承标注只读，不重复输出。\n' if request['role']=='event_curator' and request.get('component',{}).get('writer_material_review') else '')+encode({'validation_error':reason,**correction_scope(request,output)})
                 room=policy['max_prompt_chars']-len(request['rules'])-len(request['prompt'])-len(correction)-80
                 if room<0:raise PromptLimitError('提示词上限不足以容纳纠错请求，请使用待处理材料中的“按更小材料重新整理”。') from error
                 prompt=request['prompt']+correction+'\n上一份不合格输出（仅用于纠错，可能截断）：\n'+raw[:min(room,10000)]
@@ -1431,7 +1514,7 @@ async def job(database,batch,request,key,runner):
             raise
         retry_request={**request,'prompt':curator_repair_prompt(request,output,error)}
         if len(retry_request['prompt'])+len(request['rules'])>policy['max_prompt_chars']:
-            return accept_curator_omission(database,identifier,error)['output']
+            return accept_curator_omission(database,identifier,error,output,encoded_request)['output']
         try:
             output=prepare_stage_output(request,await runner(request['role'],retry_request))
             accepted=submit(database,identifier,output)
@@ -1500,7 +1583,8 @@ def extend_context(database,component,context_request,*,curator=False):
         return pending_materials.read_material(database,component,context_request['pending_material_id'])
     if 'event_id' in context_request:
         base=next(b for b in component['base_event_candidates'] if b['event_id']==context_request['event_id'])
-        candidates=[m for m in component['context_messages'] if m['id'] in set(base['source_message_ids'])]
+        source_ids=set(base['source_message_ids'])
+        candidates=[m for m in component['context_messages'] if m['id'] in source_ids]
         before=context_request.get('before_message_id',max(base['source_message_ids'])+1)
     else:
         return extend_track_context(database,component,context_request,curator=curator)
@@ -1508,7 +1592,7 @@ def extend_context(database,component,context_request,*,curator=False):
         {**context_request,'track_id':base['primary_track_id']})
 
 
-def bounded_curator_context(component,candidates,before,query):
+def bounded_curator_context(component,candidates,before,query,*,reserved_source_ids=frozenset()):
     selected=[];omitted=[];chosen=0
     covered={s for unit in component['memberships'] for s in unit['source_message_ids']}
     sessions=sorted({m['session_id'] for m in candidates})
@@ -1518,6 +1602,8 @@ def bounded_curator_context(component,candidates,before,query):
     for unit in sorted(units,key=lambda unit:unit[0]['id'],reverse=True):
         if any(m['id']>=before for m in unit):continue
         unit_ids={m['id'] for m in unit}
+        if unit_ids & reserved_source_ids:
+            omitted.append(unit[0]['id']);continue
         if unit_ids & covered and not unit_ids.issubset(covered):
             omitted.append(unit[0]['id']);continue
         reading=sorted([*unit,*selected],key=lambda m:m['id'])
@@ -1541,13 +1627,18 @@ def extend_track_context(database,component,context_request,*,curator=False):
         rows=store.conn.execute('SELECT r.* FROM pipeline_routes p JOIN raw_events r ON r.id=p.raw_id WHERE r.id<? '
             'AND EXISTS (SELECT 1 FROM json_each(?) s WHERE r.source=json_extract(s.value,\'$[0]\') '
             'AND r.session_id=json_extract(s.value,\'$[1]\')) '
-            'AND (json_extract(p.route_json,\'$.primary_track_id\')=? OR EXISTS (SELECT 1 FROM json_each(p.route_json,\'$.context_track_ids\') WHERE value=?)) ORDER BY r.id DESC'+('' if curator else ' LIMIT 6'),
+            'AND (json_extract(p.route_json,\'$.primary_track_id\')=? OR EXISTS (SELECT 1 FROM json_each(p.route_json,\'$.context_track_ids\') WHERE value=?)) '
+            +('' if curator else pending_materials.reservation_clause('r'))+' ORDER BY r.id DESC'+('' if curator else ' LIMIT 6'),
             (context_request['before_message_id'],encode(scopes),context_request['track_id'],context_request['track_id'])).fetchall()
+        reserved={int(source_id) for (source_id,) in store.conn.execute(
+            "SELECT DISTINCT ps.value FROM pipeline_pending_materials pm, json_each(pm.source_ids_json) ps "
+            "WHERE pm.status IN ('open','running')")} if curator else set()
     existing={m['id']:m for m in component['context_messages']}
     projected=[task_message(r) for r in reversed(rows)]
     prior=[item for item in projected if item['session_id'] in component['context_session_ids']]
     if curator:
-        return bounded_curator_context(component,prior,context_request['before_message_id'],context_request)
+        return bounded_curator_context(component,prior,context_request['before_message_id'],context_request,
+            reserved_source_ids=reserved)
     units=[[item] for item in sorted(prior,key=lambda item:item['id'])[-6:]]
     selected=[m for unit in units for m in unit]
     existing.update({m['id']:m for m in selected})
@@ -1885,10 +1976,6 @@ async def _advance_frozen(database,*,include_recent=False,runner=None,retry_repa
             with Store(database) as store:store.conn.execute('UPDATE pipeline_batches SET input_json=? WHERE id=?',(encoded_data,batch['id']))
             output=await job(database,batch,request,f'event_curator:{index}',runner)
             component=request['component']
-            if '_host_curator_omission' in output:
-                pause_repeated_curator_omission(database,batch,component,output)
-                plans.append((component,curator_omission_plan(component,output),[]))
-                continue
             if output.get('context_request') is not None:
                 previous_component=component
                 component=extend_context(database,component,output['context_request'],curator=True)
@@ -1900,11 +1987,12 @@ async def _advance_frozen(database,*,include_recent=False,runner=None,retry_repa
                         pretranscribed=bool(component.get('images')))
                 output=await job(database,batch,request,f'event_curator:{index}:context',runner)
                 component=request['component']
-                if '_host_curator_omission' in output:
-                    pause_repeated_curator_omission(database,batch,component,output)
-                    plans.append((component,curator_omission_plan(component,output),[]))
-                    continue
-            component=pending_materials.adopted_component(component,output)
+            component=pending_materials.adopted_component(component,output.get('_host_curator_omission',output))
+            if '_host_curator_omission' in output:
+                plan=curator_omission_plan(component,output)
+                pause_repeated_curator_omission(database,batch,component,output)
+                plans.append((component,plan,[]))
+                continue
             # job() restores its frozen request on resume; use that contract,
             # not the cache state computed before loading the saved task.
             if not request.get('pretranscribed'):

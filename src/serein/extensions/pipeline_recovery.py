@@ -58,6 +58,31 @@ def _same_scope(data, messages):
         for m in messages)
 
 
+def history_reset_cutoff(store, scope, before_id):
+    """A confirmed reset survives downstream state changes after accepted routing."""
+    from . import pipeline as p
+    rows = store.conn.execute("SELECT fresh.input_json,CAST(json_extract(old.result_json,"
+        "'$.recovery_downgrade.history_before_id') AS INTEGER) AS cutoff FROM pipeline_batches old "
+        "JOIN pipeline_batches fresh ON fresh.id=json_extract(old.result_json,'$.replacement_batch_id') "
+        "WHERE old.scope=? AND fresh.scope=old.scope AND old.status='superseded_repair' "
+        "AND json_extract(fresh.input_json,'$.routing_result._public_normalized')=1 "
+        "AND CAST(json_extract(old.result_json,'$.recovery_downgrade.history_before_id') AS INTEGER)<=? "
+        "AND json_extract(old.result_json,'$.recovery_downgrade.confirmed_by')='REBUILD_PIPELINE_BATCH' "
+        "ORDER BY cutoff DESC", (scope, before_id))
+    for row in rows:
+        data = json.loads(row['input_json'])
+        try:
+            if data.get('scope') != scope or not _same_scope(data, data.get('routing_messages', [])):
+                continue
+            p.validate_routing_result(data, data['routing_result'])
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+        # Skip/rebatch inputs deliberately omit this accepted snapshot. Merely
+        # finishing an unrouted batch therefore cannot publish a history reset.
+        return row['cutoff']
+    return 0
+
+
 def _frames(database, batch):
     """Replay accepted jobs against THEIR inputs/ordinals, without invoking job()."""
     from . import pipeline as p
@@ -100,6 +125,7 @@ def _frames(database, batch):
                  'assignments': result['assignments'], 'tracks': result['tracks'],
                  'next_track_ordinal': result['next_track_ordinal']}]
     frames = []
+    replayed_ids = set()
     cursor = 0
     state=list(original.get('tracks',[]));ordinal=original.get('next_track_ordinal',1)
     prior=list(original.get('recent',[]))
@@ -121,16 +147,25 @@ def _frames(database, batch):
             known={card['track_id']:card for card in state}
             with Store(database,read_only=True) as store:
                 for card in request['active_tracks']:
-                    if card['track_id'] not in known:
-                        tracks.assert_before(store,[card],original['routing_messages'][0]['id'])
-                        state.append(card);known[card['track_id']]=card
+                    if card['track_id'] in known:continue
+                    tracks.assert_before(store,[card],messages[0]['id'])
+                    for anchor in card['recent_source_message_ids']:
+                        if anchor < original['routing_messages'][0]['id']:continue
+                        # This candidate appeared after the seed. A predecessor's
+                        # own track is already in state; a gap needs its own receipt.
+                        route=store.conn.execute('SELECT route_json FROM pipeline_routes WHERE raw_id=?',(anchor,)).fetchone()
+                        receipt=json.loads(route[0]) if route else {}
+                        if (anchor in replayed_ids or receipt.get('source_message_id')!=anchor or
+                                card['track_id'] not in [receipt.get('primary_track_id'),*receipt.get('context_track_ids',[])]):
+                            raise p.RoutingRecoveryError('Unproved Track anchor between frozen Router frames')
+                    state.append(card);known[card['track_id']]=card
             selected=[known[card['track_id']] for card in request['active_tracks']]
             p.assert_router_state({'input_policy':{}},request,selected,ordinal,prior)
         else:
             p.assert_router_state(original,request,state,ordinal,prior)
         if 'routing_frame' in request:
             with Store(database,read_only=True) as store:
-                tracks.assert_before(store,request['active_tracks'],messages[0]['id'])
+                tracks.assert_before(store,request['active_tracks'],messages[0]['id'],routed_ids=replayed_ids)
         with Store(database,read_only=True) as store:
             for key,value in request.get('routing_frame',{}).get('source_hashes',{}).items():
                 raw=store.conn.execute('SELECT event_hash FROM raw_events WHERE id=?',(int(key),)).fetchone()
@@ -148,6 +183,7 @@ def _frames(database, batch):
             cards = tracks.update_cards(state, assignments, updates,
                                         messages, original['scope'])
         state=cards;prior.extend(messages)
+        replayed_ids.update(m['id'] for m in messages)
         used = {key for a in assignments for key in [a['primary_track_id'], *a['context_track_ids']]}
         frames.append({'batch_id': batch['id'], 'job_id': row['id'], 'messages': messages,
                        'assignments': assignments, 'tracks': [c for c in cards if c['track_id'] in used],
@@ -392,7 +428,7 @@ async def recover_batch(database, batch_id, action, confirm, max_input_chars=Non
     return await execute(database, 'pipeline', operation)
 
 
-def _rebuild(database, batch_id, *, recovery_action=None, max_input_chars=None):
+def _rebuild(database, batch_id, *, recovery_action=None, max_input_chars=None, resume_pending_id=None):
     from . import pipeline as p
     p.initialize(database)
     with Store(database) as store, store.transaction(immediate=True):
@@ -402,6 +438,10 @@ def _rebuild(database, batch_id, *, recovery_action=None, max_input_chars=None):
             batch, data, _, _ = _recovery_scope(store, batch_id)
         elif batch is None or batch['status'] != 'needs_repair':
             raise Conflict('此批已不处于待修复状态，请刷新后确认')
+        if resume_pending_id is not None and not store.conn.execute(
+                "SELECT 1 FROM pipeline_pending_materials WHERE id=? AND batch_id=? AND status='open' AND kind='unrouted'",
+                (resume_pending_id,batch_id)).fetchone():
+            raise Conflict('待办已被领取或完成，请刷新')
         data = json.loads(batch['input_json'])
         split = _recovery_chunks(data, max_input_chars) if recovery_action == 'rebatch' else None
         if split is not None and len(split) < 2:
@@ -469,7 +509,9 @@ def _rebuild(database, batch_id, *, recovery_action=None, max_input_chars=None):
         fresh['ignore_route_cache'] = True
         fresh['rebuild_of'] = batch_id
         fresh['queue_order'] = data.get('queue_order', batch['queue_order'])
-        route_only=batch_id.startswith('route:') and not recovery_action
+        if resume_pending_id is not None:
+            fresh.update(resume_pending_id=resume_pending_id,pending_previous_batch_id=batch_id)
+        route_only=batch_id.startswith('route:') and not recovery_action and resume_pending_id is None
         replacement = ('route:' if route_only else 'pipeline:')+digest(encode([batch_id, uuid4().hex]))
         audit = {'status': 'superseded_repair', 'replacement_batch_id': replacement,
                  'confirmed_at': now(), 'previous_result': previous_result,
@@ -508,6 +550,10 @@ def _rebuild(database, batch_id, *, recovery_action=None, max_input_chars=None):
                       'note': '旧计划与模型结果已保留，尚未处理的原话将重新归线；已保存的 Event 不变。'}
         store.conn.execute("UPDATE pipeline_batches SET status='superseded_repair',result_json=? WHERE id=?",
                            (encode(audit), batch_id))
-        store.conn.execute("UPDATE pipeline_pending_materials SET status=?,updated_at=? WHERE batch_id=? AND status IN ('open','running')",
-                           ('resolved_skipped' if recovery_action=='skip' else 'resolved_rebuilt',now(),batch_id))
+        if resume_pending_id is not None:
+            store.conn.execute("UPDATE pipeline_pending_materials SET batch_id=?,status='running',updated_at=? WHERE id=?",
+                               (replacement,now(),resume_pending_id))
+        else:
+            store.conn.execute("UPDATE pipeline_pending_materials SET status=?,updated_at=? WHERE batch_id=? AND status IN ('open','running')",
+                               ('resolved_skipped' if recovery_action=='skip' else 'resolved_rebuilt',now(),batch_id))
         return result

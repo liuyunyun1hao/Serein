@@ -6,7 +6,7 @@ import {buildNarrativeTaskPrompt,normalizeNarrativeWriterResult,runNarrativeCode
 import {buildSceneEvidenceRefs} from '../server/sceneEvidenceBridge.mjs';
 import {resolveGatewayObservationOutcome,gatewayRequestLabel,resolveBridgeObservationOutcome} from '../src/recallObservationOutcome.js';
 import {readFileSync} from 'node:fs';
-import {loadWindowShadows,windowShadowViews} from '../src/storage/windowShadowStore.js';
+import {loadWindowShadows,windowShadowViews,windowShadowPortraits} from '../src/storage/windowShadowStore.js';
 import {readLiveWindowShadows} from '../vite.config.mjs';
 
 test('imported and revised shadow sections reach portraits without syncing instance introductions',async(t)=>{
@@ -18,7 +18,7 @@ test('imported and revised shadow sections reach portraits without syncing insta
     t.mock.method(globalThis,'fetch',async(url,options)=>{
       assert.equal(url,'http://synthetic.invalid/api/window-shadows?limit=100&include_content=1');
       assert.equal(options.method,'GET');
-      return {ok:true,status:200,json:async()=>({windows:[{window_id:'imported',title:'Imported shadow',created_at:'2026-09-27T01:00:00Z',content:'Full shadow',sections}]})};
+      return {ok:true,status:200,json:async()=>({portrait_views:{user_view:{text:sections.user_view,title:'Imported shadow',position:1},self_view:{text:'沿用的自己',title:'Earlier shadow',position:2}},windows:[{window_id:'imported',title:'Imported shadow',created_at:'2026-09-27T01:00:00Z',content:'Full shadow',sections}]})};
     });
     const projection=await readLiveWindowShadows();
     t.mock.method(globalThis,'fetch',async(url,options)=>{
@@ -27,6 +27,7 @@ test('imported and revised shadow sections reach portraits without syncing insta
       return {ok:true,json:async()=>projection};
     });
     assert.deepEqual(windowShadowViews((await loadWindowShadows())[0]),{user:sections.user_view,assistant:sections.self_view});
+    assert.deepEqual(windowShadowPortraits(await loadWindowShadows()),{user:{text:sections.user_view,source:''},assistant:{text:'沿用的自己',source:'沿用倒数第 2 篇窗影 · Earlier shadow'}});
     assert.deepEqual(windowShadowViews({...projection.shadows[0],sections:{user_view:'修订后的你',self_view:''}}),{user:'修订后的你',assistant:''});
     assert.deepEqual(windowShadowViews(null),{user:'',assistant:''});
   } finally {
@@ -103,6 +104,32 @@ test('writer preserves long source-bound narrative bodies',()=>{
     no_new_inference:true,no_meta_explanation:true,no_forced_closure:true,dates_preserved:true,identity_correct:true};
   const body='The story continues.\n'.repeat(600)+'🌧️ A final paragraph.';
   assert.equal(normalizeNarrativeWriterResult({evidence_sufficient:true,body,issues:[],self_review}).body,body);
+});
+test('API Writer still rejects schema-valid but inconsistent evidence and self-review',async()=>{
+  const schema=JSON.parse(readFileSync(new URL('../codex_agents/narrative_writer/output.schema.json',import.meta.url),'utf8'));
+  const self_review=Object.fromEntries(schema.properties.self_review.required.map(key=>[key,true]));
+  const valid={evidence_sufficient:true,body:'Synthetic sourced body.',issues:[],self_review};
+  const insufficient={...valid,evidence_sufficient:false,body:'',issues:['More source text is needed.'],
+    self_review:{...self_review,source_bound:false}};
+  const args={mode:'rewrite',title:'Synthetic narrative',currentBody:'',materials:{},
+    roleDir:fileURLToPath(new URL('../codex_agents/narrative_writer/',import.meta.url))};
+  const backendFor=result=>async path=>path==='/v1/settings'
+    ?{ok:true,payload:{identity:{user_name:'Nori',ai_name:'Atlas'},upstream:{writer_enabled:true},
+      models:[{id:'writer',model:'deepseek-v4-pro'}],assignments:{writer:'writer'}}}
+    :{ok:true,payload:{result}};
+  for(const output of [
+    {...valid,body:''}, {...valid,issues:['Unresolved evidence.']},
+    {...valid,self_review:{...self_review,no_new_inference:false}},
+    {...insufficient,body:'Must not publish this.'}, {...insufficient,issues:[]},
+    {...insufficient,self_review},
+  ])await assert.rejects(runNarrativeCodexTask(args,{backend:backendFor(output)}),
+    /narrative_writer_(sufficient|insufficient)_result_invalid/);
+  for(const output of [valid,insufficient]){
+    const preview=await runNarrativeCodexTask(args,{backend:backendFor(output)});
+    assert.equal(preview.status,output.evidence_sufficient?'ok':'insufficient');
+    assert.equal(preview.publication_status,'not_published');
+    assert.deepEqual(preview.writes_performed,[]);
+  }
 });
 test('writer disabled means no runner starts',async()=>{
   delete process.env.SEREIN_WRITER_ENABLED;

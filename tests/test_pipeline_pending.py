@@ -15,6 +15,28 @@ async def insufficient(role,request):
     return {'evidence_sufficient':False,'self_review':{}} if role=='event_writer' else output_for(role,request)
 
 
+def test_curator_unknown_field_is_retained_without_writing(settings):
+    ingest(settings)
+    calls=[]
+    async def extra_field(role,request):
+        calls.append(role)
+        output=output_for(role,request)
+        if role=='event_curator':output['events'][0]['primary_activity_details']='Synthetic extra summary'
+        return output
+    for _ in range(2):
+        with pytest.raises(ValueError,match="unexpected=\\['primary_activity_details'\\]"):
+            asyncio.run(p.advance(settings.database,include_recent=True,runner=extra_field))
+    assert asyncio.run(p.advance(settings.database,include_recent=True,runner=extra_field))['status']=='retained'
+    before=list(calls)
+    asyncio.run(p.advance(settings.database,include_recent=True,runner=extra_field))
+    assert calls==before and 'event_writer' not in calls
+    with Store(settings.database) as store:
+        assert store.conn.execute('SELECT count(*) FROM fact_events').fetchone()[0]==0
+        assert store.conn.execute('SELECT count(*) FROM raw_processing').fetchone()[0]==0
+        item=pending.entries(store.conn)[0]
+    assert 'Synthetic extra summary' in pending.detail(settings.database,item['id'])['last_error']['output_text']
+
+
 def retained(settings):
     ingest(settings)
     result=asyncio.run(p.advance(settings.database,include_recent=True,runner=insufficient))
@@ -90,6 +112,52 @@ def test_retained_originals_are_short_references_in_router_prompt(settings):
         return output_for(role,request)
     assert asyncio.run(p.advance(settings.database,include_recent=True,runner=good))['events']==1
     assert calls==['track_router']
+
+
+def test_track_context_supplement_excludes_reserved_originals(settings):
+    item=retained(settings);ingest(settings,2)
+    p.initialize(settings.database);batch=p.new_batch(settings.database,True)
+    data=json.loads(batch['input_json'])
+    routed=asyncio.run(p.route_batch(settings.database,batch,data,synthetic_runner))
+    data=p.save_routing_snapshot(settings.database,batch,data,routed)
+    component=data['components'][0]
+    assert item['source_ids']==[1,2]
+    with Store(settings.database,read_only=True) as store:
+        assert store.conn.execute('SELECT count(*) FROM pipeline_routes WHERE raw_id IN (1,2)').fetchone()[0]==2
+        old_tracks=[json.loads(row[0])['primary_track_id'] for row in store.conn.execute(
+            'SELECT route_json FROM pipeline_routes WHERE raw_id IN (1,2) ORDER BY raw_id')]
+    assert component['track_ids'][0] in old_tracks
+    assert component['track_ids'][0] in [card['track_id'] for card in routed['tracks']]
+    supplement=p.extend_track_context(settings.database,component,{
+        'track_id':component['track_ids'][0],
+        'before_message_id':min(m['id'] for m in component['messages'])},curator=True)
+    assert not set(item['source_ids']).intersection(supplement['context_receipt']['read_source_ids'])
+    writer=p.extend_track_context(settings.database,component,{
+        'track_id':component['track_ids'][0],
+        'before_message_id':min(m['id'] for m in component['messages'])},curator=False)
+    assert not set(item['source_ids']).intersection(writer['context_receipt']['read_source_ids'])
+
+
+def test_curator_track_supplement_keeps_reserved_dialogue_unit_whole(settings):
+    item=retained(settings);ingest(settings,2)
+    p.initialize(settings.database);batch=p.new_batch(settings.database,True)
+    data=json.loads(batch['input_json'])
+    routed=asyncio.run(p.route_batch(settings.database,batch,data,synthetic_runner))
+    component=p.save_routing_snapshot(settings.database,batch,data,routed)['components'][0]
+    query={'track_id':component['track_ids'][0],
+           'before_message_id':min(m['id'] for m in component['messages'])}
+    with Store(settings.database) as store:
+        store.conn.execute('UPDATE pipeline_pending_materials SET source_ids_json=? WHERE id=?',
+                           (json.dumps([2]),item['id']))
+    blocked=p.extend_track_context(settings.database,component,query,curator=True)
+    assert not {1,2}.intersection(blocked['context_receipt']['read_source_ids'])
+    assert 1 in blocked['context_receipt']['omitted_unit_roots']
+    writer=p.extend_track_context(settings.database,component,query,curator=False)
+    assert 2 not in writer['context_receipt']['read_source_ids']
+    with Store(settings.database) as store:
+        store.conn.execute("UPDATE pipeline_pending_materials SET status='resolved' WHERE id=?",(item['id'],))
+    released=p.extend_track_context(settings.database,component,query,curator=True)
+    assert {1,2}.issubset(released['context_receipt']['read_source_ids'])
 
 
 def test_partial_batch_resume_never_rewrites_the_successful_event(settings):

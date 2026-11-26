@@ -6,8 +6,13 @@ import logging
 from copy import deepcopy
 from datetime import datetime
 from uuid import uuid4
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 import httpx
+from jsonschema.exceptions import SchemaError, ValidationError
+from jsonschema.validators import Draft202012Validator, validator_for
+from referencing import Registry
+from referencing.exceptions import Unresolvable
 from fastapi import APIRouter, HTTPException, Header, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse
 from ..deployment import read_settings, task_model, chat_models, client_model_id
@@ -172,9 +177,10 @@ def routes(settings, services, auth):
         use_memory = options.get('memory', state['upstream']['memory_enabled'])
         if type(use_memory) is not bool:
             raise HTTPException(400, 'memory must be boolean')
-        window_id = next((str(value).strip() for value in
+        explicit_window = next((str(value).strip() for value in
             (options.get('window_id'), x_serein_window_id, x_ombre_session_id)
-            if value is not None and str(value).strip()), 'main')
+            if value is not None and str(value).strip()), '')
+        window_id = explicit_window or 'main'
         if len(window_id)>200:
             raise HTTPException(400, 'Window ID must be at most 200 characters')
         context.operit_context_rewrite_enabled = state['upstream']['operit_enabled']
@@ -210,6 +216,7 @@ def routes(settings, services, auth):
         model = task_model(settings.database, 'chat', requested=str(body.get('model') or ''))
         if not model:
             raise HTTPException(503, 'Configure upstreams and models in Settings')
+        upstream_session = {'go_session_id': explicit_window} if model.get('opencode_go_session') else {}
         cache_contract={'model':{k:v for k,v in model.items() if k!='api_key'}, 'memory':use_memory,
                         'operit':state['upstream']['operit_enabled'], 'identity':state['identity'],
                         'features':state['features'],'assignments':state['assignments'], 'resume':state['resume'],
@@ -272,7 +279,11 @@ def routes(settings, services, auth):
                 if not memory_ready(settings):
                     raise HTTPException(409, 'Prepare the selected embedding model, reranker and routes in Settings')
                 from ..chat_state import recent_deliveries
-                cooldown = list(dict.fromkeys([*recent_deliveries(settings.database,window_id), *delivered_ids]))
+                from ..recall.policy import RecallPolicy
+                policy = RecallPolicy.from_config({**settings.recall, **state['recall']})
+                recent = recent_deliveries(settings.database, mode=policy.cooldown_mode,
+                                           rounds=policy.cooldown_rounds, hours=policy.cooldown_hours)
+                cooldown = list(dict.fromkeys([*recent, *delivered_ids]))
                 result = await asyncio.to_thread(services.recall, query, method='semantic', mode='surface',
                     min_cosine=-1, limit=2, user_utterance=True,
                     delivered_ids=cooldown, deadline_at=time.monotonic()+30)
@@ -319,12 +330,14 @@ def routes(settings, services, auth):
                 context._update_reasoning_cache(cache_window,message)
                 context._update_turn_injection_snapshot_after_assistant(cache_window,
                     {'turn_injection_snapshot':{'snapshot_key':snapshot_key}},message)
-            if use_memory and query:
+            final_reply = not message.get('tool_calls') and bool(message.get('content'))
+            if query and (use_memory or final_reply):
                 from ..chat_state import record_delivery
                 record_delivery(settings.database,window_id,receipt_id,selected,
                                 query=observation.payload['query'], observation_id=observation.id,
-                                memory_items=summary.get('prepared_items', []))
-            if not message.get('tool_calls') and message.get('content'):
+                                memory_items=summary.get('prepared_items', []),
+                                count_round=final_reply, audit=use_memory)
+            if final_reply:
                 from ..chat_features import delivered, after_reply
                 first_delivery = feature_receipt and not feature_receipt.get('delivered')
                 if first_delivery:
@@ -333,7 +346,8 @@ def routes(settings, services, auth):
                 if first_delivery and (state['features']['persona'] or state['features']['anti_retreat']):
                     background_tasks.add_task(after_reply,settings.database,window_id,feature_receipt.get('user_query',query),
                         context._coerce_message_text(message['content']),incoming,
-                        round_id=feature_receipt.get('round'),recalled_ids=selected)
+                        round_id=feature_receipt.get('round'),recalled_ids=selected,
+                        persona_round=feature_receipt.get('persona_round'))
         headers_out = {'X-Serein-Memory':'enabled' if use_memory else 'disabled',
             'X-Serein-Selected-Ids':json.dumps(selected,ensure_ascii=True),
             'X-Serein-Receipt-Id':receipt_id if use_memory else '',
@@ -343,7 +357,7 @@ def routes(settings, services, auth):
         headers_out['X-Serein-Resume-Items'] = str(resume_items)
         if not body.get('stream'):
             try:
-                result = await complete(model,body,window_id=window_id)
+                result = await complete(model,body,window_id=window_id,**upstream_session)
                 message = result['choices'][0]['message']
             except (UpstreamError, httpx.HTTPStatusError) as exc:
                 if headers_out['X-Serein-Resume']=='loaded' and chat_resume.context_limit(exc.response):
@@ -354,7 +368,7 @@ def routes(settings, services, auth):
                 raise HTTPException(502,'Upstream request failed or returned an invalid response') from None
             completed(message)
             return JSONResponse(result,headers=headers_out,background=background_tasks)
-        url,headers,payload = request_for(model,body,window_id=window_id)
+        url,headers,payload = request_for(model,body,window_id=window_id,**upstream_session)
         client = httpx.AsyncClient(timeout=120,follow_redirects=False)
         try:
             response = await client.send(client.build_request('POST',url,headers=headers,json=payload),stream=True)
@@ -413,10 +427,42 @@ def routes(settings, services, auth):
             raise HTTPException(400,'Writer requires prompt and output_schema')
         if body.get('image_inputs'):
             raise HTTPException(400,'Narrative Writer accepts text materials only')
+        schema = body['output_schema']
         try:
-            result=await asyncio.wait_for(complete({**model,'request_timeout_seconds':300},{'messages':[{'role':'user','content':body['prompt']}],
-                'response_format':{'type':'json_schema','json_schema':{'name':'narrative_preview','strict':True,'schema':body['output_schema']}}}),timeout=300)
-            return {'result':json.loads(result['choices'][0]['message']['content'])}
+            if '$schema' in schema and not isinstance(schema['$schema'], str):
+                raise ValueError('Invalid schema dialect')
+            validator_class = (validator_for(schema, default=None)
+                               if '$schema' in schema else Draft202012Validator)
+            if validator_class is None:
+                raise ValueError('Unsupported schema dialect')
+            validator_class.check_schema(schema)
+            # Never retrieve external schema references from a caller's schema.
+            validator = validator_class(schema, registry=Registry())
+        except (SchemaError, ValueError, TypeError, RecursionError):
+            raise HTTPException(400,'Writer requires a valid output_schema') from None
+        payload = {'messages': [{'role': 'user', 'content': body['prompt']}],
+            'response_format': {'type': 'json_schema', 'json_schema': {
+                'name': 'narrative_preview', 'strict': True, 'schema': schema}}}
+        # DeepSeek's official Chat Completions supports JSON mode, not strict
+        # json_schema. Do not infer the capabilities of proxies from model names
+        # or relax structured output for other providers or authoring tasks.
+        if (model.get('protocol', 'openai') == 'openai'
+                and urlsplit(model['base_url']).hostname == 'api.deepseek.com'):
+            payload['response_format'] = {'type': 'json_object'}
+            payload['messages'].insert(0, {'role': 'system', 'content': (
+                'Return only a JSON object conforming to this JSON schema. '
+                'Do not include Markdown fences or commentary.\n'
+                + json.dumps(schema, ensure_ascii=False))})
+        try:
+            result=await asyncio.wait_for(complete({**model,'request_timeout_seconds':300},payload),timeout=300)
+            choice = result['choices'][0]
+            if not isinstance(choice, dict) or choice.get('finish_reason') in ('length', 'content_filter'):
+                raise ValueError('Incomplete Writer result')
+            output = json.loads(choice['message']['content'])
+            validator.validate(output)
+            # The host still applies narrative business checks before preview
+            # and rechecks frozen materials/version fingerprints before saving.
+            return {'result':output}
         except (httpx.TimeoutException,TimeoutError):
             raise HTTPException(504,'Narrative Writer exceeded 5 minutes') from None
         except (UpstreamError, httpx.HTTPStatusError) as exc:
@@ -425,13 +471,14 @@ def routes(settings, services, auth):
                 ('narrative_writer_auth_failed', 'Writer 模型凭据失效，请检查上游密钥。') if code in (401, 403)
                 else ('narrative_writer_rate_limited', 'Writer 模型额度不足或触发限流，请稍后重试。') if code == 429
                 else ('narrative_writer_input_too_large', '材料总量超过上游容量，请减少材料后重试。') if code == 413
-                else ('narrative_writer_model_unavailable', '上游不支持所选 Writer 模型或请求，请检查模型配置。') if code in (400, 404, 422)
+                else ('narrative_writer_request_rejected', '上游拒绝 Writer 请求，请检查输出格式、输入与接口兼容性。') if code in (400, 422)
+                else ('narrative_writer_model_unavailable', '找不到所选 Writer 模型或接口，请检查模型与上游地址。') if code == 404
                 else ('narrative_writer_upstream_unavailable', 'Writer 上游服务暂不可用，请稍后重试。'))
             return JSONResponse({'status': 'error', 'reason': reason, 'message': message,
                                  'upstream_status': code}, status_code=502)
         except httpx.HTTPError:
             return JSONResponse({'status': 'error', 'reason': 'narrative_writer_upstream_unavailable',
                 'message': '无法连接 Writer 上游服务，请稍后重试。'}, status_code=502)
-        except (ValueError,KeyError,IndexError,TypeError):
+        except (ValueError,KeyError,IndexError,TypeError,ValidationError,Unresolvable,RecursionError):
             raise HTTPException(502,'Writer returned an invalid result') from None
     return router

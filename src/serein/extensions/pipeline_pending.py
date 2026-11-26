@@ -8,6 +8,11 @@ from ..core.store import Store, Conflict, encode, now
 
 
 def initialize(conn):
+    columns={row[1] for row in conn.execute('PRAGMA table_info(pipeline_attempts)')}
+    if columns and 'model' not in columns:
+        conn.execute('ALTER TABLE pipeline_attempts ADD COLUMN model TEXT')
+    if columns and 'prompt_chars' not in columns:
+        conn.execute('ALTER TABLE pipeline_attempts ADD COLUMN prompt_chars INTEGER')
     conn.execute('''CREATE TABLE IF NOT EXISTS pipeline_pending_materials(
         id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT NOT NULL UNIQUE REFERENCES pipeline_batches(id) ON UPDATE CASCADE ON DELETE CASCADE,
         scope TEXT NOT NULL, status TEXT NOT NULL, kind TEXT NOT NULL,
@@ -115,7 +120,7 @@ def entries(conn, *, limit=100):
 
 
 def last_attempt(conn,batch_id,data,*,compact=False,errors_only=False):
-    columns='a.id,a.attempt,a.created_at,a.error,length(a.output_text) AS output_chars,j.role' if compact else 'a.*,j.role'
+    columns='a.id,a.attempt,a.created_at,a.error,a.model,a.prompt_chars,length(a.output_text) AS output_chars,j.role' if compact else 'a.*,j.role'
     # A resumed completed batch gets a new ID; keep its previous output visible.
     seen=set()
     while batch_id and batch_id not in seen:
@@ -211,13 +216,13 @@ def adopted_component(component,output):
     return {**component,'messages':list(messages.values()),'adopted_pending_ids':ids}
 
 
-def check_adoption(component,plan):
+def check_adoption(component,plan,*,missing=()):
     reading=component.get('pending_material_read')
     if not reading:return
     ids={m['id'] for m in reading['messages']}
     owned={key for event in plan['events'] for key in event['source_message_ids']}
     if component.get('adopted_pending_ids'):
-        if not ids.issubset(owned) or ids.intersection(plan['skip_source_message_ids']+plan['defer_source_message_ids']):
+        if not ids.difference(missing).issubset(owned) or ids.intersection(plan['skip_source_message_ids']+plan['defer_source_message_ids']):
             raise ValueError('整份承接必须将待办全部原话纳入 Event，不允许部分承接或 skip/defer')
     elif ids.intersection(owned):raise ValueError('待办仅作背景；写入这些原话前必须明确 adopt_pending_material_ids')
 
@@ -240,6 +245,17 @@ def finish_adoptions(conn,plans,processed,event_ids):
 def resume(database,pending_id,*,replan=False):
     from . import pipeline as p
     p.initialize(database)
+    if replan:
+        with Store(database,read_only=True) as store:
+            broken=store.conn.execute("""SELECT pm.batch_id FROM pipeline_pending_materials pm
+                JOIN pipeline_batches b ON b.id=pm.batch_id
+                WHERE pm.id=? AND pm.status='open' AND pm.kind='unrouted' AND b.status='needs_repair'""",
+                (pending_id,)).fetchone()
+        if broken:
+            # No accepted routing can be preserved. Use the existing explicit
+            # rebuild so broken cache/history is retired along with the error.
+            from .pipeline_recovery import _rebuild
+            return {**_rebuild(database,broken['batch_id'],resume_pending_id=pending_id),'status':'resumed'}
     with Store(database) as store,store.transaction(immediate=True):
         row=store.conn.execute("SELECT pm.*,b.input_json,b.status AS batch_status,b.rowid AS queue_order,b.result_json AS previous_result FROM pipeline_pending_materials pm JOIN pipeline_batches b ON b.id=pm.batch_id WHERE pm.id=? AND pm.status='open'",(pending_id,)).fetchone()
         if row is None:raise Conflict('待办已被领取或完成，请刷新')
