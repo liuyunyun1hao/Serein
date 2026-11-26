@@ -18,6 +18,17 @@ if (process.env.SEREIN_PUBLIC_ORIGIN) {
       || publicOrigin.username || publicOrigin.password || publicOrigin.pathname !== '/'
       || publicOrigin.search || publicOrigin.hash) throw new Error('SEREIN_PUBLIC_ORIGIN must be an HTTPS origin or loopback HTTP origin');
 }
+// 浏览器跨域白名单：默认空（保持原行为）。需要让网页端直连 MCP 时设置，
+// 例如 SEREIN_ALLOWED_ORIGINS="https://example.github.io"
+const allowedOrigins = (process.env.SEREIN_ALLOWED_ORIGINS || '')
+  .split(',').map(value => value.trim().replace(/\/+$/, '')).filter(Boolean);
+const originAllowed = req => {
+  if (!req.headers.origin) return true;
+  try {
+    const origin = new URL(req.headers.origin);
+    return origin.host === req.headers.host || allowedOrigins.includes(origin.origin);
+  } catch { return false; }
+};
 const tokenFile = process.env.SEREIN_MEMORY_TOKEN_FILE;
 if (!tokenFile || !memoryToken()) throw new Error('Memory token is empty');
 const web = await preview({ root: fileURLToPath(new URL('../', import.meta.url)),
@@ -51,10 +62,8 @@ const server = http.createServer((req, res) => {
     res.end('{"detail":"OAuth requires a configured HTTPS public origin"}');return;
   }
   const chat = bearerPaths.has(path) || mcp;
-  if (mcp && req.headers.origin) {
-    let originOK = false;
-    try { originOK = new URL(req.headers.origin).host === req.headers.host; } catch {}
-    if (!originOK) { res.writeHead(403); res.end('Invalid origin'); return; }
+  if (mcp && !originAllowed(req)) {
+    res.writeHead(403); res.end('Invalid origin'); return;
   }
   if (!chat && !oauth && !requireWebAuth(req, res, filename)) return;
   if (path === '/__serein/gateway-key/copy' || path === '/__serein/gateway-key/rotate') {
